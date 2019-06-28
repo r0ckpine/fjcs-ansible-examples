@@ -1,0 +1,189 @@
+---
+
+- name: create webserver instance and the network
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - webserver_vars.yml
+  tasks:
+    - name: create a network
+      os_network:
+        name: "{{ network_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: create a subnet
+      os_subnet:
+        name: "{{ subnet_name }}"
+        network_name: "{{ network_name }}"
+        cidr: "{{ subnet_cidr }}"
+        dns_nameservers: "{{ dns_servers }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: create a router
+      os_router:
+        name: "{{ router_name }}"
+        network: "{{ router_attached_network }}"
+        interfaces:
+          - "{{ subnet_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: create SSH security group
+      os_security_group:
+        name: ssh
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: add rule to allow SSH connections
+      os_security_group_rule:
+        security_group: ssh
+        protocol: tcp
+        port_range_min: 22
+        port_range_max: 22
+        remote_ip_prefix: 0.0.0.0/0
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: create HTTP security group
+      os_security_group:
+        name: http
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: register an public key as keypair
+      os_keypair:
+        name: "{{ keypair_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        public_key_file: "{{ keypair_public_key_file_path }}"
+        state: present
+
+    - name: create a new volume
+      os_volume:
+        display_name: "{{ volume_name }}"
+        image: "{{ volume_image }}"
+        size: "{{ volume_size }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: create instance and boot from the volume
+      os_server:
+        name: "{{ server_name }}"
+        flavor: "{{ server_flavor }}"
+        key_name: "{{ keypair_name }}"
+        boot_volume: "{{ volume_name }}"
+        security_groups:
+          - default
+          - ssh
+          - http
+        network: "{{ network_name }}"
+        auto_ip: yes
+        userdata: "{{ server_userdata | default(omit) }}"
+        meta: "{{ server_meta | default(omit) }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: retrieve facts about the instance
+      os_server_facts:
+        server: "{{ server_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+      register: nova_webserver
+
+    - name: add webserver to inventory
+      add_host:
+        name: "{{ item.name }}"
+        groups: webservers
+        ansible_host: "{{ item.accessIPv4 }}"
+        ansible_user: k5user
+        ansible_ssh_private_key_file: "{{ keypair_private_key_file_path }}"
+        ansible_ssh_extra_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+      with_items: "{{ nova_webserver.ansible_facts.openstack_servers }}"
+
+
+- name: wait for port 22 to be ready
+  hosts: webservers
+  gather_facts: no
+  tasks:
+    - name: wait 300 seconds for port 22 to become open
+      wait_for:
+        port: 22
+        host: '{{ (ansible_ssh_host | default(ansible_host)) | default(inventory_hostname) }}'
+        search_regex: OpenSSH
+        delay: 10
+        timeout: 300
+      connection: local
+
+
+- name: perform yum update and httpd installation
+  hosts: webservers
+  vars_files:
+    - webserver_vars.yml
+  become: yes
+  tasks:
+    - name: perform yum update
+      yum:
+        name: '*'
+        state: latest
+      environment: "{{ proxy_env | default(omit) }}"
+
+    - name: install the latest version of httpd
+      yum:
+        name: httpd
+        state: latest
+      environment: "{{ proxy_env | default(omit) }}"
+
+    - name: enable httpd service
+      systemd:
+        name: httpd
+        state: started
+        enabled: yes
+
+    - name: put a simple web page
+      copy:
+        content: 'FUJITSU Cloud Service for OSS'
+        dest: /var/www/html/index.html
+        owner: root
+        group: root
+        mode: 0644
+
+
+- name: restart the instance, then allow HTTP connections
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - webserver_vars.yml
+  tasks:
+    - name: stop the instance
+      os_server_action:
+        action: stop
+        server: "{{ server_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        timeout: 180
+
+    - name: start the instance
+      os_server_action:
+        action: start
+        server: "{{ server_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        timeout: 180
+
+    - name: add rule to allow HTTP connections
+      os_security_group_rule:
+        security_group: http
+        protocol: tcp
+        port_range_min: 80
+        port_range_max: 80
+        remote_ip_prefix: 0.0.0.0/0
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+
+- name: print message
+  hosts: webservers
+  gather_facts: no
+  tasks:
+    - debug:
+        msg: "Please open http://{{ ansible_host }}/"

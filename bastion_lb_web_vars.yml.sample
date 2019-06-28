@@ -1,0 +1,65 @@
+---
+# Target cloud name that is defined in OpenStack clouds.yml
+target_cloud: jp-east-3
+
+# Network
+network_name: test-network
+subnet_name: test-subnet
+subnet_cidr: 192.168.100.0/24
+dns_servers:
+  - 8.8.8.8
+router_attached_network: fip-net
+router_name: test-router
+
+# Keypair (specify the pub/priv key file path)
+keypair_name: ansible_key
+keypair_public_key_file_path: ./id_rsa_ansible.pub
+keypair_private_key_file_path: ./id_rsa_ansible
+
+# Volume
+volume_image: "CentOS 7.3 64bit (English) 01"
+volume_size: 35
+
+# Server Group
+server_group_name: test_server_group
+num_webservers: 3
+
+# Instance
+bastion_name: test-bastion
+bastion_flavor: C3-1
+
+webserver_name_prefix: test-webserver
+webserver_flavor: C3-1
+
+# Username for image
+cloud_user_name: k5user
+
+# Load balancer
+load_balancer_name: test-load-balancer
+
+# Listener
+listener_name: test-load-balancer-http
+listener_protocol: HTTP
+listener_protocol_port: 80
+
+# Pool
+pool_name: test-load-balancer-pool-http
+load_balancer_algorithm: ROUND_ROBIN
+pool_protocol: HTTP
+
+# Health monitor
+healthmonitor_name: test-load-balancer-healthmonitor
+delay_time: 5
+timeout: 5
+max_retries: 3
+health_monitor_type: TCP
+
+# Member
+backend_protocol_port: 80
+
+# Proxy environment vars (if required)
+proxy_env: {}
+#proxy_env:
+#  http_proxy:
+#  https_proxy:
+#  no_proxy:

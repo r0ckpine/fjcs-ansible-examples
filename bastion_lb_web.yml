@@ -1,0 +1,565 @@
+---
+
+# Create network, router, sg, keypair and a bastion instance 
+- name: create network and bastion server
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - bastion_lb_web_vars.yml
+  tasks:
+    - name: create a network
+      os_network:
+        name: "{{ network_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: create a subnet
+      os_subnet:
+        name: "{{ subnet_name }}"
+        network_name: "{{ network_name }}"
+        cidr: "{{ subnet_cidr }}"
+        dns_nameservers: "{{ dns_servers }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: create a router
+      os_router:
+        name: "{{ router_name }}"
+        network: "{{ router_attached_network }}"
+        interfaces:
+          - "{{ subnet_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: create SSH security group
+      os_security_group:
+        name: ssh
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: add rule to allow SSH connections
+      os_security_group_rule:
+        security_group: ssh
+        protocol: tcp
+        port_range_min: 22
+        port_range_max: 22
+        remote_ip_prefix: 0.0.0.0/0
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: create internal security group
+      os_security_group:
+        name: internal
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: add rule for internal connection (SSH and HTTP)
+      os_security_group_rule:
+        security_group: internal
+        direction: "{{ item[0] }}"
+        protocol: tcp
+        port_range_min: "{{ item[1] }}"
+        port_range_max: "{{ item[1] }}"
+        remote_group: internal
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+      with_nested:
+        - [ "ingress", "egress" ]
+        - [ 22, 80 ]
+
+    - name: add rule to allow HTTP connections(internal, for LBaaS)
+      os_security_group_rule:
+        security_group: internal
+        protocol: tcp
+        port_range_min: 80
+        port_range_max: 80
+        remote_ip_prefix: "{{ subnet_cidr }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: create HTTP security group
+      os_security_group:
+        name: http
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+      register: sg_http
+
+    - name: register an public key as keypair
+      os_keypair:
+        name: "{{ keypair_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        public_key_file: "{{ keypair_public_key_file_path }}"
+        state: present
+
+    - name: create bastion instance and boot from the volume
+      os_server:
+        name: "{{ bastion_name }}"
+        flavor: "{{ bastion_flavor }}"
+        key_name: "{{ keypair_name }}"
+        image: "{{ volume_image }}"
+        volume_size: "{{ volume_size }}"
+        boot_from_volume: yes
+        terminate_volume: yes
+        security_groups:
+          - default
+          - ssh
+          - internal
+        network: "{{ network_name }}"
+        auto_ip: no
+        userdata: "{{ server_userdata | default(omit) }}"
+        meta: "{{ server_meta | default(omit) }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: assign a new floating ip for bastion
+      os_floating_ip:
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+        reuse: yes
+        server: "{{ bastion_name }}"
+        network: "{{ router_attached_network }}"
+        wait: true
+        timeout: 180
+
+    - name: retrieve facts about the bastion instance
+      os_server_facts:
+        server: "{{ bastion_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+      register: nova_bastion
+
+    - name: add bastion to inventory
+      add_host:
+        name: "{{ item.name }}"
+        groups: bastion
+        ansible_host: "{{ item.accessIPv4 }}"
+        ansible_user: "{{ cloud_user_name }}"
+        ansible_ssh_private_key_file: "{{ keypair_private_key_file_path }}"
+        ansible_ssh_extra_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+      with_items: "{{ nova_bastion.ansible_facts.openstack_servers }}"
+      changed_when: False
+
+    - name: keep bastion ip address
+      set_fact:
+        bastion_ip: "{{ nova_bastion.ansible_facts.openstack_servers[0].accessIPv4 }}"
+
+
+# Setup bastion
+- name: wait for bastion port 22 to be ready
+  hosts: bastion
+  gather_facts: no
+  tasks:
+    - name: wait 300 seconds for bastion port 22 to become open
+      wait_for_connection:
+        delay: 10
+        timeout: 300
+
+- name: perform yum update on bastion
+  hosts: bastion
+  vars_files:
+    - bastion_lb_web_vars.yml
+  become: yes
+  tasks:
+    - name: perform yum update on bastion
+      yum:
+        name: '*'
+        state: latest
+      environment: "{{ proxy_env }}"
+
+- name: restart the bastion instance
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - bastion_lb_web_vars.yml
+  tasks:
+    - name: stop the bastion instance
+      os_server_action:
+        action: stop
+        server: "{{ item.name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        timeout: 180
+      with_items: "{{ nova_bastion.ansible_facts.openstack_servers }}"
+
+    - name: start the bastion instance
+      os_server_action:
+        action: start
+        server: "{{ item.name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        timeout: 180
+      with_items: "{{ nova_bastion.ansible_facts.openstack_servers }}"
+
+
+# Create servergroup and webserver instances
+- name: create webservers
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - bastion_lb_web_vars.yml
+  tasks:
+    # Create webservers
+    - name: create server group
+      os_server_group:
+        name: "{{ server_group_name }}"
+        policies:
+          - anti-affinity
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+      register: server_group_result
+
+    - name: create webserver instances and boot from the volume
+      os_server:
+        name: "{{ webserver_name_prefix }}_{{ item }}"
+        flavor: "{{ webserver_flavor }}"
+        key_name: "{{ keypair_name }}"
+        image: "{{ volume_image }}"
+        volume_size: "{{ volume_size }}"
+        boot_from_volume: yes
+        terminate_volume: yes
+        security_groups:
+          - default
+          - internal
+        network: "{{ network_name }}"
+        auto_ip: no
+        userdata: "{{ server_userdata | default(omit) }}"
+        meta: "{{ server_meta | default(omit) }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+        scheduler_hints:
+          group: "{{ server_group_result.id }}"
+      with_sequence: "count={{ num_webservers }}"
+
+    - name: retrieve facts about the webserver instances
+      os_server_facts:
+        server: "{{ webserver_name_prefix }}_*"
+        cloud: "{{ target_cloud | default(omit) }}"
+      register: nova_webservers
+
+    - name: keep webserver ip private addresses
+      set_fact:
+        webserver_private_ips: "{{ nova_webservers.ansible_facts.openstack_servers | map(attribute='private_v4') | list }}"
+
+    - name: add webservers to inventory
+      add_host:
+        name: "{{ item.name }}"
+        groups: webservers
+        ansible_host: "{{ item.private_v4 }}"
+        ansible_user: "{{ cloud_user_name }}"
+        ansible_ssh_private_key_file: "{{ keypair_private_key_file_path }}"
+        ansible_ssh_extra_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        ansible_ssh_common_args: '-o ProxyCommand="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i {{ keypair_private_key_file_path }} -W %h:%p {{ cloud_user_name }}@{{ bastion_ip }}"'
+      with_items: "{{ nova_webservers.ansible_facts.openstack_servers }}"
+      changed_when: False
+
+
+# Setup webservers
+- name: wait for webserver port 22 to be ready
+  hosts: webservers
+  gather_facts: no
+  tasks:
+    - name: wait 300 seconds for webservers port 22 to become open
+      wait_for_connection:
+        delay: 10
+        timeout: 300
+
+- name: perform yum update and httpd installation on webservers
+  hosts: webservers
+  vars_files:
+    - bastion_lb_web_vars.yml
+  become: yes
+  tasks:
+    - name: perform yum update on webservers
+      yum:
+        name: '*'
+        state: latest
+      environment: "{{ proxy_env }}"
+
+    - name: install the latest version of httpd
+      yum:
+        name: httpd
+        state: latest
+      environment: "{{ proxy_env }}"
+
+    - name: enable httpd service
+      systemd:
+        name: httpd
+        state: started
+        enabled: yes
+
+    - name: put a simple web page
+      copy:
+        content: 'FUJITSU Cloud Service for OSS on {{ ansible_ssh_host }}'
+        dest: /var/www/html/index.html
+        owner: root
+        group: root
+        mode: 0644
+
+- name: restart the webserver instances
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - bastion_lb_web_vars.yml
+  tasks:
+    - name: stop the webserver instances
+      os_server_action:
+        action: stop
+        server: "{{ item.name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        timeout: 180
+      with_items: "{{ nova_webservers.ansible_facts.openstack_servers }}"
+
+    - name: start the webserver instances
+      os_server_action:
+        action: start
+        server: "{{ item.name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        timeout: 180
+      with_items: "{{ nova_webservers.ansible_facts.openstack_servers }}"
+
+
+# Create and setup Loadbalancer
+- name: create loadbalancer
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - bastion_lb_web_vars.yml
+    - clouds.yml
+  environment:
+    OS_AUTH_URL: "{{ clouds[target_cloud]['auth']['auth_url'] }}"
+    OS_PROJECT_ID: "{{ clouds[target_cloud]['auth']['project_id'] }}"
+    OS_USER_DOMAIN_NAME: "{{ clouds[target_cloud]['auth']['user_domain_name'] }}"
+    OS_USERNAME: "{{ clouds[target_cloud]['auth']['username'] }}"
+    OS_PASSWORD: "{{ clouds[target_cloud]['auth']['password'] }}"
+    NEUTRONCLIENT_INSECURE: "{{ '1' if clouds[target_cloud]['verify']|default(True) == False else '' }}"
+  tasks:
+    - name: get load balancer if already exists
+      command: >
+        neutron
+        lbaas-loadbalancer-show "{{ load_balancer_name }}"
+      register: load_balancer_show_result
+      changed_when: load_balancer_show_result.rc > 0
+      failed_when: false
+
+    - name: set load balancer information fact(existing)
+      set_fact:
+        load_balancer_info: "{{ load_balancer_show_result.stdout | table_to_dict }}"
+      when: not load_balancer_show_result.changed
+
+    - name: create load balancer
+      command: >
+        neutron
+        lbaas-loadbalancer-create
+        --name "{{ load_balancer_name }}"
+        "{{ subnet_name }}"
+      register: load_balancer_result
+      when: load_balancer_show_result.changed
+
+    - name: set load balancer information fact
+      set_fact:
+        load_balancer_info: "{{ load_balancer_result.stdout | table_to_dict }}"
+      when: load_balancer_show_result.changed
+
+    - name: wait 60 seconds
+      pause:
+        seconds: 60
+      when: load_balancer_show_result.changed
+
+    - name: get listener if already exists
+      command: >
+        neutron
+        lbaas-listener-show "{{ listener_name }}"
+      register: listener_show_result
+      changed_when: listener_show_result.rc > 0
+      failed_when: false
+
+    - name: set listener information fact(existing)
+      set_fact:
+        listener_info: "{{ listener_show_result.stdout | table_to_dict }}"
+      when: not listener_show_result.changed
+
+    - name: create listener
+      command: >
+        neutron
+        lbaas-listener-create
+        --name "{{ listener_name }}"
+        --loadbalancer "{{ load_balancer_info['id'] }}"
+        --protocol "{{ listener_protocol }}"
+        --protocol-port "{{ listener_protocol_port }}"
+      register: listener_result
+      when: listener_show_result.changed
+
+    - name: set listener information fact
+      set_fact:
+        listener_info: "{{ listener_result.stdout | table_to_dict }}"
+      when: listener_show_result.changed
+
+    - name: wait 15 seconds
+      pause:
+        seconds: 15
+      when: listener_show_result.changed
+
+    - name: get pool if already exists
+      command: >
+        neutron
+        lbaas-pool-show "{{ pool_name }}"
+      register: pool_show_result
+      changed_when: pool_show_result.rc > 0
+      failed_when: false
+
+    - name: set pool information fact(existing)
+      set_fact:
+        pool_info: "{{ pool_show_result.stdout | table_to_dict }}"
+      when: not pool_show_result.changed
+
+    - name: create pool
+      command: >
+        neutron
+        lbaas-pool-create
+        --name "{{ pool_name }}"
+        --lb-algorithm "{{ load_balancer_algorithm }}"
+        --listener "{{ listener_info['id'] }}"
+        --protocol "{{ pool_protocol }}"
+      register: pool_result
+      when: pool_show_result.changed
+
+    - name: set pool information fact
+      set_fact:
+        pool_info: "{{ pool_result.stdout | table_to_dict }}"
+      when: pool_show_result.changed
+
+    - name: wait 15 seconds
+      pause:
+        seconds: 15
+      when: pool_show_result.changed
+
+    - name: get healthmonitor if already exists
+      command: >
+        neutron
+        lbaas-healthmonitor-show "{{ healthmonitor_name }}"
+      register: healthmonitor_show_result
+      changed_when: healthmonitor_show_result.rc > 0
+      failed_when: false
+
+    - name: set healthmonitor information fact(existing)
+      set_fact:
+        healthmonitor_info: "{{ healthmonitor_show_result.stdout | table_to_dict }}"
+      when: not healthmonitor_show_result.changed
+
+    - name: create health monitor
+      command: >
+        neutron
+        lbaas-healthmonitor-create
+        --name "{{ healthmonitor_name }}"
+        --pool "{{ pool_info['id'] }}"
+        --delay "{{ delay_time }}"
+        --timeout "{{ timeout }}"
+        --max-retries "{{ max_retries }}"
+        --type "{{ health_monitor_type }}"
+      register: health_monitor_result
+      when: healthmonitor_show_result.changed
+
+    - name: wait 15 seconds
+      pause:
+        seconds: 15
+      when: healthmonitor_show_result.changed
+
+    - name: get member if already exists
+      command: >
+        neutron
+        lbaas-member-list "{{ pool_name }}"
+      register: member_list_result
+      changed_when: member_list_result.rc > 0
+      failed_when: false
+
+    - name: set member address list fact(existing)
+      set_fact:
+        member_list: "{{ member_list_result.stdout | table_to_list | map(attribute='address') | list }}"
+
+    - name: create member
+      shell: >
+        sleep 1;
+        neutron
+        lbaas-member-create
+        --subnet "{{ subnet_name }}"
+        --address "{{ item }}"
+        --protocol-port "{{ backend_protocol_port }}"
+        "{{ pool_info['id'] }}"
+      with_items: "{{ webserver_private_ips }}"
+      when: member_list | intersect(webserver_private_ips) | length == 0
+
+    - name: get port info of lbaas port
+      command: >
+        neutron
+        port-show
+        "{{ load_balancer_info['vip_port_id'] }}"
+      register: port_show_result
+      changed_when: false
+
+    - name: set port information fact
+      set_fact:
+        port_info: "{{ port_show_result.stdout | table_to_dict }}"
+
+    - name: set security group to lbaas port
+      command: >
+        neutron
+        port-update
+        --security-group "{{ sg_http.id }}"
+        "{{ load_balancer_info['vip_port_id'] }}"
+      when: 'not sg_http.id in port_info["security_groups"]'
+
+    - name: add rule to allow HTTP connections
+      os_security_group_rule:
+        security_group: http
+        protocol: tcp
+        port_range_min: 80
+        port_range_max: 80
+        remote_ip_prefix: 0.0.0.0/0
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: get floatingip if already exists
+      command: >
+        neutron
+        floatingip-list
+      register: floatingip_list_result
+      changed_when: floatingip_list_result.rc > 0
+      failed_when: false
+
+    - name: set floatingip list fact(existing)
+      set_fact:
+        fip_id_list: "{{ floatingip_list_result.stdout | table_to_list | map(attribute='port_id') | list }}"
+
+    - name: create floatingip
+      command: >
+        neutron
+        floatingip-create
+        "{{ router_attached_network }}"
+      register: fip_result
+      when: not load_balancer_info['vip_port_id'] in fip_id_list
+
+    - name: set floating ip information fact
+      set_fact:
+        fip_info: "{{ fip_result.stdout | table_to_dict }}"
+      when: not load_balancer_info['vip_port_id'] in fip_id_list
+
+    - name: assign floatingip
+      command: >
+        neutron
+        floatingip-associate
+        "{{ fip_info['id'] }}"
+        "{{ load_balancer_info['vip_port_id'] }}"
+      register: fip_result
+      when: not load_balancer_info['vip_port_id'] in fip_id_list
+
+    - debug:
+        msg: "Please open http://{{ fip_info['floating_ip_address'] }}/"
+      when: not load_balancer_info['vip_port_id'] in fip_id_list
+
+    - debug:
+        msg: "Please open http://{{ floatingip_list_result.stdout | table_to_list | json_query(query) | first }}/"
+      vars:
+        query: "[?port_id==`{{ load_balancer_info['vip_port_id'] }}`].floating_ip_address"
+      when: load_balancer_info['vip_port_id'] in fip_id_list
