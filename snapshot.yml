@@ -1,0 +1,45 @@
+--- # FUJITSU Cloud Service for OSS IaaS Design and Configuration Guide
+- name: Create a snapshot for cloning and restoring pattern
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - snapshot_vars.yml
+    - clouds.yml
+  environment:
+    OS_AUTH_URL: "{{ clouds[target_cloud]['auth']['auth_url'] }}"
+    OS_DOMAIN_NAME: "{{ clouds[target_cloud]['auth']['user_domain_name'] }}"
+    OS_USER_DOMAIN_NAME: "{{ clouds[target_cloud]['auth']['user_domain_name'] }}"
+    OS_USERNAME: "{{ clouds[target_cloud]['auth']['username'] }}"
+    OS_PASSWORD: "{{ clouds[target_cloud]['auth']['password'] }}"
+    OS_PROJECT_ID: "{{ clouds[target_cloud]['auth']['project_id'] }}"
+    OS_IDENTITY_API_VERSION: "{{ clouds[target_cloud]['identity_api_version'] }}"
+  tasks:
+    - name: Stop the target server
+      os_server_action:
+        action: stop
+        server: "{{ instance_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+
+    - name: Create a snapshot
+      command: >-
+        openstack
+        volume snapshot create
+        --volume {{ volume_name }}
+        --force --format json
+        {{ snapshot_name }}
+      register: res
+      environment: "{{ proxy_env }}"
+
+    - name: Check snapshot status
+      command: >-
+        openstack
+        volume snapshot show
+        {{ (res.stdout | from_json).id }}
+        --format json
+      changed_when: false
+      register: snap_show
+      environment: "{{ proxy_env }}"
+      until: (snap_show.stdout | from_json).status == 'available'
+      retries: 6
+      delay: 10

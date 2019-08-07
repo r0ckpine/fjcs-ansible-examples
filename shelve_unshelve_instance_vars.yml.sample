@@ -1,0 +1,13 @@
+---
+# Target cloud name that is defined in OpenStack clouds.yml
+target_cloud: jp-east-3
+
+# Instance
+instance_id: "YOUR INSTANCE UUID"
+
+# Proxy environment vars (if required)
+proxy_env: {}
+# proxy_env:
+#  http_proxy:
+#  https_proxy:
+#  no_proxy:

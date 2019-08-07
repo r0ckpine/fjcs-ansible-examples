@@ -1,0 +1,136 @@
+--- # FUJITSU Cloud Service for OSS IaaS Design and Configuration Guide
+- name: Snapshot / Restore pattern
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - snapshot_vars.yml
+    - clouds.yml
+  environment:
+    OS_AUTH_URL: "{{ clouds[target_cloud]['auth']['auth_url'] }}"
+    OS_DOMAIN_NAME: "{{ clouds[target_cloud]['auth']['user_domain_name'] }}"
+    OS_USER_DOMAIN_NAME: "{{ clouds[target_cloud]['auth']['user_domain_name'] }}"
+    OS_USERNAME: "{{ clouds[target_cloud]['auth']['username'] }}"
+    OS_PASSWORD: "{{ clouds[target_cloud]['auth']['password'] }}"
+    OS_PROJECT_ID: "{{ clouds[target_cloud]['auth']['project_id'] }}"
+    OS_IDENTITY_API_VERSION: "{{ clouds[target_cloud]['identity_api_version'] }}"
+  tasks:
+    - name: get server status
+      command: >-
+        openstack
+        server show
+        -f yaml
+        {{ instance_name }}
+      register: server_status_before_shelve
+      changed_when: false
+      environment: "{{ proxy_env }}"
+
+    - name: check server status
+      assert:
+        that: >-
+          (server_status_before_shelve.stdout | from_yaml)['status'] in ['ACTIVE', 'SHUTOFF', 'SUSPENDED']
+        msg: "Server status is not ACTIVE, SHUTOFF or SUSPENDED."
+
+    - name: Shelve the target server
+      command: >-
+        openstack
+        server shelve
+        {{ instance_name }}
+      environment: "{{ proxy_env }}"
+
+    - name: Check server status
+      command: >-
+        openstack
+        server show
+        {{ instance_name }}
+        --format json
+      register: serv_show
+      changed_when: false
+      environment: "{{ proxy_env }}"
+      until: (serv_show.stdout | from_json).status == 'SHELVED_OFFLOADED'
+
+    - name: Set volume status (available)
+      command: >-
+        openstack
+        volume set --state
+        available
+        {{ volume_name }}
+      environment: "{{ proxy_env }}"
+    
+    - name: Check volume status
+      command: >-
+        openstack
+        volume show
+        {{ volume_name }}
+        --format json
+      register: vol_show
+      changed_when: false
+      environment: "{{ proxy_env }}"
+      until: (vol_show.stdout | from_json).status == 'available'
+      retries: 6
+      delay: 10
+
+    - name: Revert to snapshot
+      command: >-
+        cinder
+        --os-volume-api-version 3.40
+        revert-to-snapshot
+        {{ snapshot_id }}
+      environment: "{{ proxy_env }}"
+
+    - name: Set volume status (in-use)
+      command: >-
+        openstack
+        volume set --state
+        in-use
+        {{ volume_name }}
+      environment: "{{ proxy_env }}"
+
+    - name: Check volume status
+      command: >-
+        openstack
+        volume show
+        {{ volume_name }}
+        --format json
+      register: vol_show
+      changed_when: false
+      environment: "{{ proxy_env }}"
+      until: (vol_show.stdout | from_json).status == 'in-use'
+      retries: 6
+      delay: 10
+
+    - name: get server status
+      command: >-
+        openstack
+        server show
+        -f yaml
+        {{ instance_name }}
+      register: server_status_before_unshelve
+      changed_when: false
+      environment: "{{ proxy_env }}"
+
+    - name: check server status
+      assert:
+        that: >-
+          (server_status_before_unshelve.stdout | from_yaml)['status'] == 'SHELVED_OFFLOADED'
+        msg: "Server status is not SHELVED_OFFLOADED."
+
+    - name: Unshelve the restored server
+      command: >-
+        openstack
+        server unshelve
+        {{ instance_name }}
+      environment: "{{ proxy_env }}"
+
+    - name: Check server status
+      command: >-
+        openstack
+        server show
+        {{ instance_name }}
+        --format json
+      register: serv_show
+      changed_when: false
+      environment: "{{ proxy_env }}"
+      until: (serv_show.stdout | from_json).status == 'ACTIVE'
+      retries: 6
+      delay: 10

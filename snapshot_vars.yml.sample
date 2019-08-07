@@ -1,0 +1,39 @@
+---
+# Target cloud name that is defined in OpenStack clouds.yml
+target_cloud: jp-east-3
+
+# Original instance
+instance_name: <Your instance name or id>
+
+# Original Volume
+volume_name: <Your volume name or id>
+volume_size: <Your volume size>
+
+# Keypair (specify the pub/priv key file path)
+keypair_name: <Your keypair name>
+
+# Network
+network_name: <Your network name>
+
+# Proxy environment vars (if required)
+proxy_env: {}
+# proxy_env:
+#  http_proxy:
+#  https_proxy:
+#  no_proxy:
+
+# Snapshot name
+snapshot_name: demo-snapshot
+## please enter your snapshot_id after snapshot creation
+snapshot_id: <demo-snapshot's UUID>
+
+# Clone server info
+clone_volume_name: clone-volume
+clone_instance_name: clone-instance
+clone_image_name: 'My CentOS 7.5'
+clone_instance_flavor: C3-1
+
+# Image creation server info
+tmp_volume_name: tmp-volume
+tmp_instance_name: tmp-instance
+tmp_instance_flavor: C3-1

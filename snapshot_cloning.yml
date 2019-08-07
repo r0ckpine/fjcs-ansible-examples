@@ -1,0 +1,30 @@
+--- # FUJITSU Cloud Service for OSS IaaS Design and Configuration Guide
+- name: Snapshot / Replication pattern
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - snapshot_vars.yml
+    - clouds.yml
+  tasks:
+    - name: Create a clone volume from snapshot
+      os_volume:
+        display_name: "{{ clone_volume_name }}"
+        snapshot_id: "{{ snapshot_id }}"
+        size: "{{ volume_size }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: Create a clone server
+      os_server:
+        name: "{{ clone_instance_name }}"
+        flavor: "{{ clone_instance_flavor }}"
+        key_name: "{{ keypair_name }}"
+        terminate_volume: yes
+        boot_volume: "{{ clone_volume_name }}"
+        network: "{{ network_name }}"
+        security_groups:
+          - default
+        auto_ip: no
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present

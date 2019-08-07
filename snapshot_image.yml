@@ -1,0 +1,67 @@
+--- # FUJITSU Cloud Service for OSS IaaS Design and Configuration Guide
+- name: Image / Replication pattern
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - snapshot_vars.yml
+    - clouds.yml
+  environment:
+    OS_AUTH_URL: "{{ clouds[target_cloud]['auth']['auth_url'] }}"
+    OS_DOMAIN_NAME: "{{ clouds[target_cloud]['auth']['user_domain_name'] }}"
+    OS_USER_DOMAIN_NAME: "{{ clouds[target_cloud]['auth']['user_domain_name'] }}"
+    OS_USERNAME: "{{ clouds[target_cloud]['auth']['username'] }}"
+    OS_PASSWORD: "{{ clouds[target_cloud]['auth']['password'] }}"
+    OS_PROJECT_ID: "{{ clouds[target_cloud]['auth']['project_id'] }}"
+    OS_IDENTITY_API_VERSION: "{{ clouds[target_cloud]['identity_api_version'] }}"
+  tasks:
+    - name: Create a temporary volume from snapshot
+      os_volume:
+        display_name: "{{ tmp_volume_name }}"
+        snapshot_id: "{{ snapshot_id }}"
+        size: "{{ volume_size }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: Create a temporary server
+      os_server:
+        name: "{{ tmp_instance_name }}"
+        flavor: "{{ tmp_instance_flavor }}"
+        key_name: "{{ keypair_name }}"
+        terminate_volume: yes
+        boot_volume: "{{ tmp_volume_name }}"
+        network: "{{ network_name }}"
+        security_groups:
+          - default
+        auto_ip: no
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: Stop a temporary server
+      os_server_action:
+        action: stop
+        server: "{{ tmp_instance_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+
+    - name: Create a image
+      command: >-
+        cinder
+        upload-to-image
+        --force True --disk-format qcow2
+        {{ tmp_volume_name }}
+        '{{ clone_image_name }}'
+      register: res
+      environment: "{{ proxy_env }}"
+
+    - name: Check image status
+      command: >-
+        openstack
+        image show
+        --format json
+        {{ (res.stdout | table_to_dict)['image_id'] }}
+      register: img_show
+      changed_when: false
+      environment: "{{ proxy_env }}"
+      until: (img_show.stdout | from_json).status == 'active'
+      retries: 60
+      delay: 30
