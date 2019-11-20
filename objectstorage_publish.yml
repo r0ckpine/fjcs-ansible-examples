@@ -1,0 +1,178 @@
+--- # FUJITSU Cloud Service for OSS IaaS Design and Configuration Guide
+- name: Objectstorage publish pattern
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - objectstorage_publish_vars.yml
+    - clouds.yml
+  environment: "{{ proxy_env }}"
+  tasks:
+    - name: Authenticate to FJCS for OSS
+      os_auth:
+        cloud: "{{ target_cloud | default(omit) }}"
+
+    - name: Set s3 endpoint url
+      set_fact:
+        _s3_ep_url: "https://objectstorage-s.{{ target_cloud | default(omit) }}.cloud.global.fujitsu.com/"
+
+    - name: Get s3 accounts
+      uri:
+        url: "{{ _s3_ep_url }}v2/admin/accounts"
+        method: GET
+        headers:
+          X-Auth-Token: "{{ auth_token }}"
+        return_content: yes
+      register: _s3tenant
+
+    - name: Set list of existing account names
+      set_fact:
+        _account_list: "{{ _account_list | default([]) + [ item.name ] }}"
+      with_items: "{{ _s3tenant.json.data }}"
+
+    - name: Create a s3 account
+      uri:
+        url: "{{ _s3_ep_url }}v2/admin/accounts"
+        method: POST
+        headers:
+          X-Auth-Token: "{{ auth_token }}"
+        body_format: json
+        body: "{{ s3_account }}"
+        return_content: yes
+        status_code: 201
+      when: s3_account.name not in _account_list
+
+    - name: Get s3 accounts
+      uri:
+        url: "{{ _s3_ep_url }}v2/admin/accounts"
+        method: GET
+        headers:
+          X-Auth-Token: "{{ auth_token }}"
+        return_content: yes
+      register: _s3account
+
+    - name: Set account_id
+      set_fact:
+        _account_id: "{{ item.id }}"
+      with_items: "{{ _s3account.json.data }}"
+      when: item.name == s3_account.name
+
+    - name: Get s3 groups
+      uri:
+        url: "{{ _s3_ep_url }}v2/admin/{{ _account_id }}/groups"
+        method: GET
+        headers:
+          X-Auth-Token: "{{ auth_token }}"
+        return_content: yes
+      register: _s3group
+
+    - name: Set list of existing group names
+      set_fact:
+        _group_list: "{{ _group_list | default([]) + [ item.displayName ] }}"
+      with_items: "{{ _s3group.json.data }}"
+
+    - name: Create a s3 group
+      uri:
+        url: "{{ _s3_ep_url }}v2/admin/{{ _account_id }}/groups"
+        method: POST
+        headers:
+          X-Auth-Token: "{{ auth_token }}"
+        body_format: json
+        body: "{{ s3_group }}"
+        return_content: yes
+        status_code: 201
+      when: s3_group.uniqueName not in _group_list
+
+    - name: Get s3 groups
+      uri:
+        url: "{{ _s3_ep_url }}v2/admin/{{ _account_id }}/groups"
+        method: GET
+        headers:
+          X-Auth-Token: "{{ auth_token }}"
+        return_content: yes
+      register: _s3group
+
+    - name: Set group_id
+      set_fact:
+        _group_id: "{{ item.id }}"
+      with_items: "{{ _s3group.json.data }}"
+      when: item.displayName == s3_group.uniqueName
+
+    - name: Get s3 users
+      uri:
+        url: "{{ _s3_ep_url }}v2/admin/{{ _account_id }}/users"
+        method: GET
+        headers:
+          X-Auth-Token: "{{ auth_token }}"
+        return_content: yes
+      register: _s3user
+
+    - name: Set list of existing user names
+      set_fact:
+        _user_list: "{{ _user_list | default([]) + [ item.fullName ] }}"
+      with_items: "{{ _s3user.json.data }}"
+
+    - name: Create a s3 user
+      uri:
+        url: "{{ _s3_ep_url }}v2/admin/{{ _account_id }}/users"
+        method: POST
+        headers:
+          X-Auth-Token: "{{ auth_token }}"
+        body_format: json
+        body:  {"uniqueName": "{{ s3_user_name }}", "memberOf": ["{{ _group_id }}"]}
+        return_content: yes
+        status_code: 201
+      when: s3_user_name not in _user_list
+
+    - name: Get s3 users
+      uri:
+        url: "{{ _s3_ep_url }}v2/admin/{{ _account_id }}/users"
+        method: GET
+        headers:
+          X-Auth-Token: "{{ auth_token }}"
+        return_content: yes
+      register: _s3user
+
+    - name: Generate access key and secret key
+      uri:
+        url: "{{ _s3_ep_url }}v2/admin/{{ _account_id }}/users/{{ item.id }}/s3-access-keys" 
+        method: POST
+        headers:
+          X-Auth-Token: "{{ auth_token }}"
+        body_format: json
+        body: {"expires": null}
+        status_code: 201
+      with_items: "{{ _s3user.json.data }}"
+      when: item.fullName == s3_user_name
+      register: _key
+
+    - name: Configure aws cli
+      expect:
+        command: aws configure --profile "{{ profile_name }}"
+        responses:
+          '^AWS Access.*': "{{ _key.results[1].json.data.accessKey }}"
+          '^AWS Secret.*': "{{ _key.results[1].json.data.secretAccessKey }}"
+          '^Default region.*': "{{ target_cloud | default(omit) }}"
+          '^Default output.*': "json"
+
+    - name: Create a bucket
+      command: >
+        aws s3api create-bucket
+        --bucket "{{ bucket_name }}"
+        --endpoint-url "{{ _s3_ep_url }}"
+        --profile "{{ profile_name }}"
+
+    - name: Apply policy
+      command: >
+        aws s3api put-bucket-policy
+        --bucket "{{ bucket_name }}"
+        --policy '{{ public_policy }}'
+        --endpoint-url "{{ _s3_ep_url }}"
+        --profile "{{ profile_name }}"
+
+    - name: Upload a file
+      command: >
+        aws s3 cp "{{ file_name }}"
+        s3://{{ bucket_name }}/{{ file_name }}
+        --endpoint-url "{{ _s3_ep_url }}"
+        --profile "{{ profile_name }}"

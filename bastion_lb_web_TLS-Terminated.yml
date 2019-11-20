@@ -1,0 +1,482 @@
+---
+# FUJITSU Cloud Service for OSS IaaS Design and Configuration Guide
+# Create network, router, sg, keypair and a bastion instance 
+- name: create network and bastion server
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - bastion_lb_web_TLS-Terminated_vars.yml
+  environment: "{{ proxy_env }}"
+  tasks:
+    - name: create a network
+      os_network:
+        name: "{{ network_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: create a subnet
+      os_subnet:
+        name: "{{ subnet_name }}"
+        network_name: "{{ network_name }}"
+        cidr: "{{ subnet_cidr }}"
+        dns_nameservers: "{{ dns_servers }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+      register: subnet
+
+    - name: create a router
+      os_router:
+        name: "{{ router_name }}"
+        network: "{{ router_attached_network }}"
+        interfaces:
+          - "{{ subnet_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: create SSH security group
+      os_security_group:
+        name: ssh
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: add rule to allow SSH connections
+      os_security_group_rule:
+        security_group: ssh
+        protocol: tcp
+        port_range_min: 22
+        port_range_max: 22
+        remote_ip_prefix: 0.0.0.0/0
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: create internal security group
+      os_security_group:
+        name: internal
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: add rule for internal connection (SSH and HTTP)
+      os_security_group_rule:
+        security_group: internal
+        direction: "{{ item[0] }}"
+        protocol: tcp
+        port_range_min: "{{ item[1] }}"
+        port_range_max: "{{ item[1] }}"
+        remote_group: internal
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+      with_nested:
+        - [ "ingress", "egress" ]
+        - [ 22, 80 ]
+
+    - name: add rule to allow HTTP connections(internal, for LBaaS)
+      os_security_group_rule:
+        security_group: internal
+        protocol: tcp
+        port_range_min: 80
+        port_range_max: 80
+        remote_ip_prefix: "{{ subnet_cidr }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: register an public key as keypair
+      os_keypair:
+        name: "{{ keypair_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        public_key_file: "{{ keypair_public_key_file_path }}"
+        state: present
+
+    - name: create bastion instance and boot from the volume
+      os_server:
+        name: "{{ bastion_name }}"
+        flavor: "{{ bastion_flavor }}"
+        key_name: "{{ keypair_name }}"
+        image: "{{ volume_image }}"
+        volume_size: "{{ volume_size }}"
+        boot_from_volume: yes
+        terminate_volume: yes
+        security_groups:
+          - default
+          - ssh
+          - internal
+        network: "{{ network_name }}"
+        auto_ip: yes
+        floating_ip_pools: "{{ router_attached_network }}"
+        userdata: "{{ server_userdata | default(omit) }}"
+        meta: "{{ server_meta | default(omit) }}"
+        timeout: 600
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+
+    - name: retrieve facts about the bastion instance
+      os_server_facts:
+        server: "{{ bastion_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+      register: nova_bastion
+
+    - name: add bastion to inventory
+      add_host:
+        name: "{{ item.name }}"
+        groups: bastion
+        ansible_host: "{{ item.accessIPv4 }}"
+        ansible_user: "{{ cloud_user_name }}"
+        ansible_ssh_private_key_file: "{{ keypair_private_key_file_path }}"
+        ansible_ssh_extra_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+      with_items: "{{ nova_bastion.ansible_facts.openstack_servers }}"
+      changed_when: False
+
+    - name: keep bastion ip address
+      set_fact:
+        bastion_ip: "{{ nova_bastion.ansible_facts.openstack_servers[0].accessIPv4 }}"
+
+# Setup bastion
+- name: wait for bastion port 22 to be ready
+  hosts: bastion
+  gather_facts: no
+  tasks:
+    - name: wait 300 seconds for bastion port 22 to become open
+      wait_for_connection:
+        delay: 10
+        timeout: 300
+
+- name: perform yum update on bastion
+  hosts: bastion
+  vars_files:
+    - bastion_lb_web_TLS-Terminated_vars.yml
+  become: yes
+  tasks:
+    - name: perform yum update on bastion
+      yum:
+        name: '*'
+        state: latest
+
+- name: restart the bastion instance
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - bastion_lb_web_TLS-Terminated_vars.yml
+  environment: "{{ proxy_env }}"
+  tasks:
+    - name: stop the bastion instance
+      os_server_action:
+        action: stop
+        server: "{{ item.name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        timeout: 180
+      with_items: "{{ nova_bastion.ansible_facts.openstack_servers }}"
+
+    - name: start the bastion instance
+      os_server_action:
+        action: start
+        server: "{{ item.name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        timeout: 180
+      with_items: "{{ nova_bastion.ansible_facts.openstack_servers }}"
+
+# Create servergroup and webserver instances
+- name: create webservers
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - bastion_lb_web_TLS-Terminated_vars.yml
+  environment: "{{ proxy_env }}"
+  tasks:
+    - name: create server group
+      os_server_group:
+        name: "{{ server_group_name }}"
+        policies:
+          - anti-affinity
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+      register: server_group_result
+
+    - name: create webserver instances and boot from the volume
+      os_server:
+        name: "{{ webserver_name_prefix }}-{{ item }}"
+        flavor: "{{ webserver_flavor }}"
+        key_name: "{{ keypair_name }}"
+        image: "{{ volume_image }}"
+        volume_size: "{{ volume_size }}"
+        boot_from_volume: yes
+        terminate_volume: yes
+        security_groups:
+          - default
+          - internal
+        network: "{{ network_name }}"
+        auto_ip: no
+        userdata: "{{ server_userdata | default(omit) }}"
+        meta: "{{ server_meta | default(omit) }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        state: present
+        scheduler_hints:
+          group: "{{ server_group_result.id }}"
+      with_sequence: "count={{ num_webservers }}"
+
+    - name: retrieve facts about the webserver instances
+      os_server_facts:
+        server: "{{ webserver_name_prefix }}-*"
+        cloud: "{{ target_cloud | default(omit) }}"
+      register: nova_webservers
+
+    - name: keep webserver ip private addresses
+      set_fact:
+        webserver_private_ips: "{{ nova_webservers.ansible_facts.openstack_servers | map(attribute='private_v4') | list }}"
+
+    - name: add webservers to inventory
+      add_host:
+        name: "{{ item.name }}"
+        groups: webservers
+        ansible_host: "{{ item.private_v4 }}"
+        ansible_user: "{{ cloud_user_name }}"
+        ansible_ssh_private_key_file: "{{ keypair_private_key_file_path }}"
+        ansible_ssh_extra_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        ansible_ssh_common_args: '-o ProxyCommand="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i {{ keypair_private_key_file_path }} -W %h:%p {{ cloud_user_name }}@{{ bastion_ip }}"'
+      with_items: "{{ nova_webservers.ansible_facts.openstack_servers }}"
+      changed_when: False
+
+# Setup webservers
+- name: wait for webserver port 22 to be ready
+  hosts: webservers
+  gather_facts: no
+  tasks:
+    - name: wait 300 seconds for webservers port 22 to become open
+      wait_for_connection:
+        delay: 10
+        timeout: 300
+
+- name: perform yum update and httpd installation on webservers
+  hosts: webservers
+  vars_files:
+    - bastion_lb_web_TLS-Terminated_vars.yml
+  become: yes
+  tasks:
+    - name: perform yum update on webservers
+      yum:
+        name: '*'
+        state: latest
+
+    - name: install the latest version of httpd
+      yum:
+        name: httpd
+        state: latest
+
+    - name: enable httpd service
+      systemd:
+        name: httpd
+        state: started
+        enabled: yes
+
+    - name: put a simple web page
+      copy:
+        content: 'FUJITSU Cloud Service for OSS on {{ ansible_ssh_host }}'
+        dest: /var/www/html/index.html
+        owner: root
+        group: root
+        mode: 0644
+
+- name: restart the webserver instances
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - bastion_lb_web_TLS-Terminated_vars.yml
+  environment: "{{ proxy_env }}"
+  tasks:
+    - name: stop the webserver instances
+      os_server_action:
+        action: stop
+        server: "{{ item.name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        timeout: 180
+      with_items: "{{ nova_webservers.ansible_facts.openstack_servers }}"
+
+    - name: start the webserver instances
+      os_server_action:
+        action: start
+        server: "{{ item.name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+        timeout: 180
+      with_items: "{{ nova_webservers.ansible_facts.openstack_servers }}"
+
+# Create and setup loadbalancer
+- name: create and setup loadbalancer
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - bastion_lb_web_TLS-Terminated_vars.yml
+    - clouds.yml
+  environment:
+    - OS_AUTH_URL: "{{ clouds[target_cloud]['auth']['auth_url'] }}"
+    - OS_DOMAIN_NAME: "{{ clouds[target_cloud]['auth']['user_domain_name'] }}"
+    - OS_USER_DOMAIN_NAME: "{{ clouds[target_cloud]['auth']['user_domain_name'] }}"
+    - OS_USERNAME: "{{ clouds[target_cloud]['auth']['username'] }}"
+    - OS_PASSWORD: "{{ clouds[target_cloud]['auth']['password'] }}"
+    - OS_PROJECT_ID: "{{ clouds[target_cloud]['auth']['project_id'] }}"
+    - OS_IDENTITY_API_VERSION: "{{ clouds[target_cloud]['identity_api_version'] }}"
+    - "{{ proxy_env }}"
+  tasks:
+    - name: create loadbalancer/listener/pool
+      os_loadbalancer:
+        name: "{{ lb_name }}"
+        vip_subnet: "{{ subnet.id }}"
+        state: present
+        auto_public_ip: yes
+        public_network: "{{ router_attached_network }}"
+        listeners:
+          - name: "{{ listener_name }}"
+            protocol: "{{ listener_protocol }}"
+            protocol_port: "{{ listener_protocol_port }}"
+            pool:
+              name: "{{ pool_name }}"
+        cloud: "{{ target_cloud | default(omit) }}"
+
+    - name: create members
+      os_member:
+        name: "member-{{ item }}"
+        pool: "{{ pool_name }}"
+        address: "{{ item }}"
+        subnet_id: "{{ subnet.id }}"
+        state: present
+        cloud: "{{ target_cloud | default(omit) }}"
+      with_items: "{{ webserver_private_ips }}"
+
+    - name: create a healthmonitor
+      command: >
+        openstack
+        loadbalancer
+        healthmonitor
+        create
+        --name "{{ hm_name }}"
+        --delay "{{ delay_time }}"
+        --timeout "{{ timeout }}"
+        --max-retries "{{ max_retries }}"
+        --type "{{ hm_type }}"
+        --url-path "{{ hm_path }}"
+        "{{ pool_name }}"
+
+    - name: setup tls-terminated loadbalancer
+      block:
+        - name: get secrets
+          command: >
+            openstack
+            secret
+            list
+            --format json
+          register: secrets
+          changed_when: False
+
+        - name: set list of existing secret names
+          set_fact:
+            secret_list: "{{ secret_list | default([]) + [ item.Name ] }}"
+          with_items: "{{ secrets.stdout }}"
+
+        - name: cat server.crt
+          command: >
+            cat
+            "{{ crt_file }}"
+          register: cat_server_crt
+          changed_when: False
+          when: crt_name not in secret_list
+
+        - name: create secret (certificate)
+          command: >
+            openstack
+            secret store
+            --payload-content-type='text/plain'
+            --name="{{ crt_name }}"
+            --payload="{{ cat_server_crt.stdout }}"
+          when: crt_name not in secret_list
+
+        - name: cat server.key
+          command: >
+            cat
+            "{{ key_file }}"
+          register: cat_server_key
+          changed_when: False
+          when: key_name not in secret_list
+
+        - name: create secret (private_key)
+          command: >
+            openstack
+            secret store
+            --payload-content-type='text/plain'
+            --name="{{ key_name }}"
+            --payload="{{ cat_server_key.stdout }}"
+          when: key_name not in secret_list
+
+        - name: get secrets
+          command: >
+            openstack
+            secret
+            list
+            --format json
+          register: secrets
+          changed_when: False
+
+        - name: set fact for certificate
+          set_fact:
+            crt_url: "{{ item['Secret href'] }}"
+          with_items: "{{ secrets.stdout }}"
+          when: item.Name == crt_name
+
+        - name: set fact for private_key
+          set_fact:
+            key_url: "{{ item['Secret href'] }}"
+          with_items: "{{ secrets.stdout }}"
+          when: item.Name == key_name
+
+        - name: get secret containers
+          command: >
+            openstack
+            secret
+            container
+            list
+            --format json
+          register: containers
+          changed_when: False
+
+        - name: set list of existing secret containers names
+          set_fact:
+            container_list: "{{ container_list | default([]) + [ item.Name ] }}"
+          with_items: "{{ containers.stdout }}"
+
+        - name: create secret container
+          command: >
+            openstack
+            secret container create
+            --name="{{ container_name }}"
+            --type='certificate'
+            --secret="certificate={{ crt_url }}"
+            --secret="private_key={{ key_url }}"
+          when: container_name not in container_list
+
+        - name: get secret containers
+          command: >
+            openstack
+            secret
+            container
+            list
+            --format json
+          register: containers
+          changed_when: False
+
+        - name: set fact for secret container
+          set_fact:
+            container_url: "{{ item['Container href'] }}"
+          with_items: "{{ containers.stdout }}"
+          when: item.Name == container_name
+
+        - name: set default TLS container ref
+          command: >
+            openstack
+            loadbalancer
+            listener
+            set
+            --default-tls-container-ref
+            "{{ container_url }}"
+            "{{ listener_name }}"
+      when: listener_protocol  == 'TERMINATED_HTTPS'

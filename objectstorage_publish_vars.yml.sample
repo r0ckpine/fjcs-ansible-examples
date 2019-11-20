@@ -1,0 +1,48 @@
+---
+# Target cloud name that is defined in OpenStack clouds.yml
+target_cloud: jp-east-3
+
+_account_list: []
+_group_list: []
+_user_list: []
+
+s3_account: {
+  "name": "s3-ansible",
+  "quotaObjectGigaBytes": 10
+}
+
+s3_group: {
+  "uniqueName": "s3-ansible-group",
+  "Statement": [
+     {
+       "Sid": "Example group policy",
+       "Action": "s3:*",
+       "Effect": "Allow",
+       "Resource": "urn:sgws:s3:::*"
+     }
+  ]
+}
+s3_user_name: "s3-ansible-user"
+bucket_name: "<Set Unique Bucket Name>"
+profile_name: "ansible"
+file_name: "files/f_logo.png"
+
+public_policy: '{
+  "Statement": [
+    {
+      "Sid": "Example bucket policy",
+      "Action": [ "s3:GetObject" ],
+      "Effect": "Allow",
+      "Resource": "urn:sgws:s3:::<bucket_name>/*",
+      "Principal": "*"
+    }
+  ]
+}'
+
+
+# Proxy environment vars (if required)
+proxy_env: {}
+# proxy_env:
+#   http_proxy:
+#   https_proxy:
+#   no_proxy:

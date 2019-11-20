@@ -1,0 +1,72 @@
+---
+# Target cloud name that is defined in OpenStack clouds.yml
+target_cloud: jp-west-3
+
+# Server Group
+server_group_name: demo_server_group
+num_webservers: 2
+
+# Instances
+bastion_name: demo-bastion
+bastion_flavor: C3-2
+
+webserver_name_prefix: demo-srv
+webserver_flavor: C3-2
+
+# Username for image
+cloud_user_name: k5user
+
+# Volume
+volume_image: "CentOS 7.6 64bit (English) 01"
+volume_size: 30
+
+# Keypair (specify the pub/priv key file path)
+keypair_name: ansible_key
+keypair_public_key_file_path: ./id_rsa_ansible.pub
+keypair_private_key_file_path: ./id_rsa_ansible
+
+# Network
+network_name: demo-network
+subnet_name: demo-subnet
+subnet_cidr: 192.168.100.0/24
+dns_servers:
+  - 8.8.8.8
+router_attached_network: fip-net
+router_name: demo-router
+
+# LoadBalancer
+lb_name: demo-lb
+
+# Listener
+listener_protocol: TERMINATED_HTTPS
+#listener_protocol: HTTP
+listener_protocol_port: 443
+#listener_protocol_port: 80
+listener_name: demo-listener
+
+# Pool
+pool_name: demo-pool
+
+# HealthMonitor
+hm_name: demo-hm
+delay_time: 5
+timeout: 5
+max_retries: 3
+hm_type: HTTP
+hm_path: /
+
+# Certificate (Plaese set params, if you choice listener_protocol=TERMINATED_HTTPS)
+crt_name: demo-certificate
+crt_file: "files/server.crt"
+key_name: demo-private-key
+key_file: "files/server.key"
+container_name: demo-tls-container
+secret_list: []
+container_list: []
+
+# Proxy environment vars (if required)
+proxy_env: {}
+# proxy_env:
+#  http_proxy:
+#  https_proxy:
+#  no_proxy:
