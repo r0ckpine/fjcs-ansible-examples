@@ -101,7 +101,6 @@
           - ssh
           - internal
         network: "{{ network_name }}"
-        auto_ip: yes
         floating_ip_pools: "{{ router_attached_network }}"
         userdata: "{{ server_userdata | default(omit) }}"
         meta: "{{ server_meta | default(omit) }}"
